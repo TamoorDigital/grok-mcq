@@ -3,12 +3,12 @@ services:
     name: grok-mcq-backend
     env: python
 
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    buildCommand: |
+      apt-get update
+      apt-get install -y tesseract-ocr tesseract-ocr-eng
+      pip install -r requirements.txt
 
-    aptPackages:
-      - tesseract-ocr
-      - tesseract-ocr-eng
+    startCommand: gunicorn app:app
 
     envVars:
       - key: GEMINI_API_KEY
