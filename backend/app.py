@@ -11,41 +11,43 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-# ─── Google Gemini (FREE tier: 1,500 requests/day, no credit card needed) ────
-# Get your key at: https://aistudio.google.com/apikey
+# ─── FIX: Set Tesseract path (required on Render) ───
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
+# ─── Gemini Config ───
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-1.5-flash"   # fastest free model
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
-# ─────────────────────────────────────────────────────────────────────────────
+GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 
+# ─── OCR Function ───
 def extract_text_from_image(image_bytes: bytes) -> str:
     image = Image.open(io.BytesIO(image_bytes))
-    # Convert to RGB if needed (handles RGBA, palette modes)
+
+    # Ensure proper format
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
-    text = pytesseract.image_to_string(image)
+
+    text = pytesseract.image_to_string(image, lang="eng")
     return text.strip()
 
 
+# ─── Gemini Function ───
 def ask_gemini(question_text: str) -> str:
     prompt = f"""You are an expert answering MCQ (Multiple Choice Questions).
-Analyze the following text extracted from a screenshot. It may contain an MCQ question with options.
+Analyze the following text extracted from a screenshot.
 
 TEXT:
 {question_text}
 
 Instructions:
-1. Identify the question and all options (A, B, C, D or 1, 2, 3, 4 etc.)
-2. Determine the correct answer.
-3. Reply ONLY in this exact format:
-   ANSWER: [option letter/number]
-   REASON: [one sentence explanation]
+1. Identify the question and options.
+2. Select the correct answer.
+3. Reply ONLY in this format:
+   ANSWER: [option]
+   REASON: [short explanation]
 
-If it's not an MCQ, answer it directly and concisely."""
+If it's not MCQ, answer directly."""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -58,34 +60,55 @@ If it's not an MCQ, answer it directly and concisely."""
         json=payload,
         timeout=30,
     )
+
     response.raise_for_status()
     data = response.json()
+
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
+# ─── Root Route ───
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "message": "Grok MCQ Backend Running 🚀",
+        "endpoints": ["/health", "/process"]
+    })
+
+
+# ─── Health Check (SAFE) ───
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "tesseract": bool(pytesseract.get_tesseract_version())})
+    try:
+        version = str(pytesseract.get_tesseract_version())
+        tesseract_status = True
+    except Exception as e:
+        version = str(e)
+        tesseract_status = False
+
+    return jsonify({
+        "status": "ok",
+        "tesseract": tesseract_status,
+        "version": version
+    })
 
 
+# ─── Main API ───
 @app.route("/process", methods=["POST"])
 def process():
-    """
-    Accepts JSON: { "image": "<base64-encoded PNG/JPG>" }
-    Returns:      { "ocr_text": "...", "answer": "...", "full_response": "..." }
-    """
     if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY not configured on server"}), 500
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 500
 
     data = request.get_json(force=True)
-    if not data or "image" not in data:
-        return jsonify({"error": "Missing 'image' field in request body"}), 400
 
-    # Decode base64 image
+    if not data or "image" not in data:
+        return jsonify({"error": "Missing 'image' field"}), 400
+
+    # Decode image
     try:
         image_data = base64.b64decode(data["image"])
     except Exception:
-        return jsonify({"error": "Invalid base64 image data"}), 400
+        return jsonify({"error": "Invalid base64 image"}), 400
 
     # OCR
     try:
@@ -94,15 +117,17 @@ def process():
         return jsonify({"error": f"OCR failed: {str(e)}"}), 500
 
     if not ocr_text:
-        return jsonify({"error": "No text found in image"}), 422
+        return jsonify({"error": "No text found"}), 422
 
     # Gemini
     try:
         answer = ask_gemini(ocr_text)
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Gemini request failed: {str(e)}"}), 502
     except Exception as e:
-        return jsonify({"error": f"Gemini API error: {str(e)}"}), 502
+        return jsonify({"error": f"Gemini error: {str(e)}"}), 500
 
-    # Parse answer line for quick display
+    # Extract quick answer
     quick = answer
     match = re.search(r"ANSWER:\s*([^\n]+)", answer)
     if match:
@@ -111,10 +136,11 @@ def process():
     return jsonify({
         "ocr_text": ocr_text,
         "answer": quick,
-        "full_response": answer,
+        "full_response": answer
     })
 
 
+# ─── Run (local only) ───
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
