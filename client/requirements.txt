@@ -1,6 +1,5 @@
-flask==3.0.3
-flask-cors==4.0.1
-pytesseract==0.3.13
+pyinstaller==6.10.0
+pyautogui==0.9.54
 Pillow==10.4.0
 requests==2.32.3
-gunicorn==22.0.0
+keyboard==0.13.5
