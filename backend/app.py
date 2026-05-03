@@ -7,96 +7,109 @@ import io
 import os
 import re
 import requests
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# ─── Hugging Face Inference API (FREE, no credit card) ───────────────────────
-# Get your free token at: https://huggingface.co/settings/tokens
-# Free tier: unlimited requests, rate limited but reliable
-HF_API_KEY  = os.environ.get("HF_API_KEY", "")
+# ─── Hugging Face Inference API ───────────────────────────────────────────────
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
-# Model options (all free, uncomment the one you want):
-# Fast + accurate for Q&A:
-HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-# Lighter/faster fallback:
-# HF_MODEL = "microsoft/Phi-3-mini-4k-instruct"
-# Very fast, smaller:
-# HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
-
-HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-# ─────────────────────────────────────────────────────────────────────────────
+# Primary model — fast and reliable for MCQs
+PRIMARY_MODEL  = "mistralai/Mistral-7B-Instruct-v0.3"
+# Fallback model — much lighter, almost always available
+FALLBACK_MODEL = "microsoft/Phi-3-mini-4k-instruct"
 
 OCR_MAX_WIDTH = 1280
 
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     image = Image.open(io.BytesIO(image_bytes))
-
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
-
-    # Downscale large screenshots so Tesseract doesn't time out
     if image.width > OCR_MAX_WIDTH:
         ratio = OCR_MAX_WIDTH / image.width
         new_size = (OCR_MAX_WIDTH, int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
-
-    # Greyscale = faster OCR
     image = image.convert("L")
-
     text = pytesseract.image_to_string(image, timeout=25)
     return text.strip()
 
 
-def ask_hf(question_text: str) -> str:
-    prompt = f"""<s>[INST] You are an expert at answering MCQ (Multiple Choice Questions).
-Analyze the text below extracted from a screenshot.
-
-TEXT:
-{question_text}
-
-Instructions:
-1. Identify the question and all options (A, B, C, D or 1, 2, 3, 4 etc.)
-2. Determine the correct answer.
-3. Reply ONLY in this exact format:
-   ANSWER: [option letter/number]
-   REASON: [one sentence explanation]
-
-If it is not an MCQ, answer it directly and concisely. [/INST]"""
-
+def call_hf_model(model: str, prompt: str, timeout: int = 45) -> str:
+    """Call a single HF model. Raises on failure."""
+    url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {
         "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 200,
+            "max_new_tokens": 150,
             "temperature": 0.1,
             "return_full_text": False,
-            "stop": ["</s>", "[INST]"]
+            "do_sample": False,
         },
         "options": {
-            "wait_for_model": True,   # wait if model is loading instead of error
-            "use_cache": False
+            "wait_for_model": True,
+            "use_cache": False,
         }
     }
 
-    response = requests.post(HF_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
-    # If model is loading, HF returns 503 — wait_for_model handles this
-    response.raise_for_status()
-    data = response.json()
+    # 503 = model still loading — wait_for_model should handle it
+    # but if it still 503s, raise clearly
+    if resp.status_code == 503:
+        raise Exception(f"Model {model} is loading, try again in 20 seconds")
 
-    # HF returns a list
+    if resp.status_code != 200:
+        raise Exception(f"HF returned {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+
     if isinstance(data, list) and len(data) > 0:
-        return data[0].get("generated_text", "").strip()
-    elif isinstance(data, dict) and "error" in data:
-        raise Exception(f"HF model error: {data['error']}")
-    else:
-        return str(data).strip()
+        text = data[0].get("generated_text", "").strip()
+        if text:
+            return text
+        raise Exception("Model returned empty text")
+
+    if isinstance(data, dict):
+        if "error" in data:
+            raise Exception(f"Model error: {data['error']}")
+        if "generated_text" in data:
+            return data["generated_text"].strip()
+
+    raise Exception(f"Unexpected response format: {str(data)[:200]}")
+
+
+def ask_hf(question_text: str) -> str:
+    """Try primary model, fall back to secondary on failure."""
+    prompt = (
+        f"[INST] You answer MCQ questions.\n\n"
+        f"TEXT FROM SCREENSHOT:\n{question_text[:1500]}\n\n"
+        f"Find the question and options. Reply in EXACTLY this format:\n"
+        f"ANSWER: [letter]\n"
+        f"REASON: [one sentence]\n\n"
+        f"If no MCQ found, just answer the question directly. [/INST]"
+    )
+
+    # Try primary model first
+    try:
+        return call_hf_model(PRIMARY_MODEL, prompt, timeout=50)
+    except Exception as e1:
+        primary_error = str(e1)
+
+    # Try fallback model
+    try:
+        return call_hf_model(FALLBACK_MODEL, prompt, timeout=50)
+    except Exception as e2:
+        raise Exception(
+            f"Both models failed.\n"
+            f"Primary ({PRIMARY_MODEL}): {primary_error}\n"
+            f"Fallback ({FALLBACK_MODEL}): {str(e2)}"
+        )
 
 
 @app.route("/health", methods=["GET"])
@@ -106,23 +119,29 @@ def health():
         tess_ok = bool(pytesseract.get_tesseract_version())
     except Exception:
         pass
-    return jsonify({"status": "ok", "tesseract": tess_ok, "model": HF_MODEL})
+    return jsonify({
+        "status": "ok",
+        "tesseract": tess_ok,
+        "primary_model": PRIMARY_MODEL,
+        "fallback_model": FALLBACK_MODEL,
+        "hf_key_set": bool(HF_API_KEY),
+    })
 
 
 @app.route("/process", methods=["POST"])
 def process():
     if not HF_API_KEY:
-        return jsonify({"error": "HF_API_KEY not configured on server"}), 500
+        return jsonify({"error": "HF_API_KEY not set in Render environment variables"}), 500
 
     data = request.get_json(force=True)
     if not data or "image" not in data:
-        return jsonify({"error": "Missing 'image' field in request body"}), 400
+        return jsonify({"error": "Missing 'image' field"}), 400
 
-    # Decode base64 image
+    # Decode image
     try:
         image_data = base64.b64decode(data["image"])
     except Exception:
-        return jsonify({"error": "Invalid base64 image data"}), 400
+        return jsonify({"error": "Invalid base64 image"}), 400
 
     # OCR
     try:
@@ -133,20 +152,17 @@ def process():
         return jsonify({"error": f"OCR failed: {str(e)}"}), 500
 
     if not ocr_text:
-        return jsonify({"error": "No text found in image"}), 422
+        return jsonify({"error": "No text found in screenshot. Make sure text is visible on screen."}), 422
 
-    # Hugging Face
+    # Ask HF
     try:
         answer = ask_hf(ocr_text)
     except Exception as e:
-        return jsonify({"error": f"HuggingFace API error: {str(e)}"}), 502
+        return jsonify({"error": str(e)}), 502
 
-    if not answer:
-        return jsonify({"error": "Model returned empty response"}), 502
-
-    # Parse quick answer line
+    # Parse the ANSWER line for quick display
     quick = answer
-    match = re.search(r"ANSWER:\s*([^\n]+)", answer)
+    match = re.search(r"ANSWER:\s*([^\n]+)", answer, re.IGNORECASE)
     if match:
         quick = f"✅ {match.group(1).strip()}"
 
