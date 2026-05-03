@@ -7,18 +7,21 @@ import io
 import os
 import re
 import requests
-import time
 
 app = Flask(__name__)
 CORS(app)
 
-# ─── Hugging Face Inference API ───────────────────────────────────────────────
-HF_API_KEY = os.environ.get("HF_API_KEY", "")
+# ─── Groq API (FREE — 1-3 second responses) ──────────────────────────────────
+# Get free key at: https://console.groq.com  (no credit card)
+# Free limits: 30 requests/min, 14,400/day — more than enough
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-# Primary model — fast and reliable for MCQs
-PRIMARY_MODEL  = "mistralai/Mistral-7B-Instruct-v0.3"
-# Fallback model — much lighter, almost always available
-FALLBACK_MODEL = "microsoft/Phi-3-mini-4k-instruct"
+# Models available on Groq (all free, ultra fast):
+# "llama-3.1-8b-instant"   — fastest, great for MCQs  ← DEFAULT
+# "llama-3.3-70b-versatile" — more accurate, still fast
+# "mixtral-8x7b-32768"     — good balance
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 OCR_MAX_WIDTH = 1280
 
@@ -36,80 +39,48 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     return text.strip()
 
 
-def call_hf_model(model: str, prompt: str, timeout: int = 45) -> str:
-    """Call a single HF model. Raises on failure."""
-    url = f"https://api-inference.huggingface.co/models/{model}"
+def ask_groq(question_text: str) -> str:
     headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 150,
-            "temperature": 0.1,
-            "return_full_text": False,
-            "do_sample": False,
-        },
-        "options": {
-            "wait_for_model": True,
-            "use_cache": False,
-        }
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert at answering MCQ questions. "
+                    "Always reply in this exact format:\n"
+                    "ANSWER: [option letter or number]\n"
+                    "REASON: [one sentence explanation]\n"
+                    "Be fast and concise."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Answer this MCQ from the screenshot text below:\n\n"
+                    f"{question_text[:2000]}"
+                )
+            }
+        ],
+        "max_tokens": 150,
+        "temperature": 0,
+        "stream": False,
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
 
-    # 503 = model still loading — wait_for_model should handle it
-    # but if it still 503s, raise clearly
-    if resp.status_code == 503:
-        raise Exception(f"Model {model} is loading, try again in 20 seconds")
+    if resp.status_code == 429:
+        # Rate limited — retry once after 2 seconds
+        import time
+        time.sleep(2)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
 
-    if resp.status_code != 200:
-        raise Exception(f"HF returned {resp.status_code}: {resp.text[:200]}")
-
+    resp.raise_for_status()
     data = resp.json()
-
-    if isinstance(data, list) and len(data) > 0:
-        text = data[0].get("generated_text", "").strip()
-        if text:
-            return text
-        raise Exception("Model returned empty text")
-
-    if isinstance(data, dict):
-        if "error" in data:
-            raise Exception(f"Model error: {data['error']}")
-        if "generated_text" in data:
-            return data["generated_text"].strip()
-
-    raise Exception(f"Unexpected response format: {str(data)[:200]}")
-
-
-def ask_hf(question_text: str) -> str:
-    """Try primary model, fall back to secondary on failure."""
-    prompt = (
-        f"[INST] You answer MCQ questions.\n\n"
-        f"TEXT FROM SCREENSHOT:\n{question_text[:1500]}\n\n"
-        f"Find the question and options. Reply in EXACTLY this format:\n"
-        f"ANSWER: [letter]\n"
-        f"REASON: [one sentence]\n\n"
-        f"If no MCQ found, just answer the question directly. [/INST]"
-    )
-
-    # Try primary model first
-    try:
-        return call_hf_model(PRIMARY_MODEL, prompt, timeout=50)
-    except Exception as e1:
-        primary_error = str(e1)
-
-    # Try fallback model
-    try:
-        return call_hf_model(FALLBACK_MODEL, prompt, timeout=50)
-    except Exception as e2:
-        raise Exception(
-            f"Both models failed.\n"
-            f"Primary ({PRIMARY_MODEL}): {primary_error}\n"
-            f"Fallback ({FALLBACK_MODEL}): {str(e2)}"
-        )
+    return data["choices"][0]["message"]["content"].strip()
 
 
 @app.route("/health", methods=["GET"])
@@ -122,16 +93,15 @@ def health():
     return jsonify({
         "status": "ok",
         "tesseract": tess_ok,
-        "primary_model": PRIMARY_MODEL,
-        "fallback_model": FALLBACK_MODEL,
-        "hf_key_set": bool(HF_API_KEY),
+        "model": GROQ_MODEL,
+        "groq_key_set": bool(GROQ_API_KEY),
     })
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    if not HF_API_KEY:
-        return jsonify({"error": "HF_API_KEY not set in Render environment variables"}), 500
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY not set in Render environment variables"}), 500
 
     data = request.get_json(force=True)
     if not data or "image" not in data:
@@ -152,15 +122,15 @@ def process():
         return jsonify({"error": f"OCR failed: {str(e)}"}), 500
 
     if not ocr_text:
-        return jsonify({"error": "No text found in screenshot. Make sure text is visible on screen."}), 422
+        return jsonify({"error": "No text found in screenshot."}), 422
 
-    # Ask HF
+    # Groq
     try:
-        answer = ask_hf(ocr_text)
+        answer = ask_groq(ocr_text)
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": f"Groq API error: {str(e)}"}), 502
 
-    # Parse the ANSWER line for quick display
+    # Parse ANSWER line
     quick = answer
     match = re.search(r"ANSWER:\s*([^\n]+)", answer, re.IGNORECASE)
     if match:
