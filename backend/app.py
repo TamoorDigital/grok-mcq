@@ -11,23 +11,28 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-# Google Gemini (FREE tier: 1,500 requests/day, no credit card needed)
-# Get your key at: https://aistudio.google.com/apikey
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-1.5-flash"
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+# ─── Hugging Face Inference API (FREE, no credit card) ───────────────────────
+# Get your free token at: https://huggingface.co/settings/tokens
+# Free tier: unlimited requests, rate limited but reliable
+HF_API_KEY  = os.environ.get("HF_API_KEY", "")
 
-# Max width for OCR — resize large screenshots to speed up Tesseract
+# Model options (all free, uncomment the one you want):
+# Fast + accurate for Q&A:
+HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+# Lighter/faster fallback:
+# HF_MODEL = "microsoft/Phi-3-mini-4k-instruct"
+# Very fast, smaller:
+# HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
+
+HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+# ─────────────────────────────────────────────────────────────────────────────
+
 OCR_MAX_WIDTH = 1280
 
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     image = Image.open(io.BytesIO(image_bytes))
 
-    # Convert mode
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
 
@@ -37,17 +42,16 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         new_size = (OCR_MAX_WIDTH, int(image.height * ratio))
         image = image.resize(new_size, Image.LANCZOS)
 
-    # Convert to greyscale — faster OCR, same accuracy
+    # Greyscale = faster OCR
     image = image.convert("L")
 
-    # Run OCR without lang param to avoid missing language pack errors
     text = pytesseract.image_to_string(image, timeout=25)
     return text.strip()
 
 
-def ask_gemini(question_text: str) -> str:
-    prompt = f"""You are an expert answering MCQ (Multiple Choice Questions).
-Analyze the following text extracted from a screenshot. It may contain an MCQ question with options.
+def ask_hf(question_text: str) -> str:
+    prompt = f"""<s>[INST] You are an expert at answering MCQ (Multiple Choice Questions).
+Analyze the text below extracted from a screenshot.
 
 TEXT:
 {question_text}
@@ -59,22 +63,40 @@ Instructions:
    ANSWER: [option letter/number]
    REASON: [one sentence explanation]
 
-If it is not an MCQ, answer it directly and concisely."""
+If it is not an MCQ, answer it directly and concisely. [/INST]"""
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 300},
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json",
     }
 
-    response = requests.post(
-        GEMINI_URL,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
-        timeout=30,
-    )
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 200,
+            "temperature": 0.1,
+            "return_full_text": False,
+            "stop": ["</s>", "[INST]"]
+        },
+        "options": {
+            "wait_for_model": True,   # wait if model is loading instead of error
+            "use_cache": False
+        }
+    }
+
+    response = requests.post(HF_URL, headers=headers, json=payload, timeout=60)
+
+    # If model is loading, HF returns 503 — wait_for_model handles this
     response.raise_for_status()
     data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    # HF returns a list
+    if isinstance(data, list) and len(data) > 0:
+        return data[0].get("generated_text", "").strip()
+    elif isinstance(data, dict) and "error" in data:
+        raise Exception(f"HF model error: {data['error']}")
+    else:
+        return str(data).strip()
 
 
 @app.route("/health", methods=["GET"])
@@ -84,13 +106,13 @@ def health():
         tess_ok = bool(pytesseract.get_tesseract_version())
     except Exception:
         pass
-    return jsonify({"status": "ok", "tesseract": tess_ok})
+    return jsonify({"status": "ok", "tesseract": tess_ok, "model": HF_MODEL})
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY not configured on server"}), 500
+    if not HF_API_KEY:
+        return jsonify({"error": "HF_API_KEY not configured on server"}), 500
 
     data = request.get_json(force=True)
     if not data or "image" not in data:
@@ -106,19 +128,21 @@ def process():
     try:
         ocr_text = extract_text_from_image(image_data)
     except RuntimeError as e:
-        # Tesseract timeout
-        return jsonify({"error": f"OCR timed out — screenshot may be too large: {str(e)}"}), 500
+        return jsonify({"error": f"OCR timed out: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": f"OCR failed: {str(e)}"}), 500
 
     if not ocr_text:
         return jsonify({"error": "No text found in image"}), 422
 
-    # Gemini
+    # Hugging Face
     try:
-        answer = ask_gemini(ocr_text)
+        answer = ask_hf(ocr_text)
     except Exception as e:
-        return jsonify({"error": f"Gemini API error: {str(e)}"}), 502
+        return jsonify({"error": f"HuggingFace API error: {str(e)}"}), 502
+
+    if not answer:
+        return jsonify({"error": "Model returned empty response"}), 502
 
     # Parse quick answer line
     quick = answer
