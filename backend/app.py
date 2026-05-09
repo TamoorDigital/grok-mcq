@@ -21,7 +21,7 @@ GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 # "llama-3.1-8b-instant"   — fastest, great for MCQs  ← DEFAULT
 # "llama-3.3-70b-versatile" — more accurate, still fast
 # "mixtral-8x7b-32768"     — good balance
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 OCR_MAX_WIDTH = 1280
 
