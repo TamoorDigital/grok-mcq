@@ -16,9 +16,13 @@ CORS(app)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 
-GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
 GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Rate limit tracker — ensures minimum 6s gap between Gemini calls (= max 10/min safe)
+_last_gemini_call = 0.0
+GEMINI_MIN_INTERVAL = 6.0   # seconds between calls — stays under 10 RPM safely
 
 MCQ_PROMPT = (
     "Look at this screenshot carefully.\n"
@@ -33,7 +37,14 @@ MCQ_PROMPT = (
 
 
 def ask_gemini(image_b64: str) -> str:
-    """Gemini 2.5 Flash — primary, best accuracy."""
+    """Gemini 2.0 Flash Lite — primary, 30 RPM free tier."""
+    global _last_gemini_call
+    # Enforce minimum interval to avoid rate limit
+    elapsed = time.time() - _last_gemini_call
+    if elapsed < GEMINI_MIN_INTERVAL:
+        time.sleep(GEMINI_MIN_INTERVAL - elapsed)
+    _last_gemini_call = time.time()
+
     payload = {
         "contents": [{
             "parts": [
@@ -118,7 +129,7 @@ def get_answer(image_b64: str) -> tuple[str, str, str]:
     if GEMINI_API_KEY:
         try:
             answer = ask_gemini(image_b64)
-            return answer, "gemini-2.5-flash", ""
+            return answer, "gemini-2.0-flash-lite", ""
         except Exception as e:
             err = str(e)
             if "RATE_LIMIT" in err:
