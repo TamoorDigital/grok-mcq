@@ -13,9 +13,9 @@ CORS(app)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-# Primary: maverick = most accurate vision model on Groq
-# Fallback: scout   = always works, slightly less accurate
-PRIMARY_MODEL  = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Primary: gpt-oss-120b = replaced maverick, best accuracy + vision on Groq
+# Fallback: scout        = always works, fast and reliable
+PRIMARY_MODEL  = "openai/gpt-oss-120b"
 FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 MCQ_PROMPT = (
