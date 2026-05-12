@@ -13,30 +13,25 @@ CORS(app)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-# Primary: gpt-oss-120b = replaced maverick, best accuracy + vision on Groq
-# Fallback: scout        = always works, fast and reliable
-PRIMARY_MODEL  = "openai/gpt-oss-120b"
-FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Step 1: Scout reads the image and extracts text/question
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-MCQ_PROMPT = (
-    "Look at this screenshot carefully.\n"
-    "Find the MCQ question and all its options.\n"
-    "Reply ONLY in this exact format:\n"
-    "ANSWER: [option letter or number]\n"
-    "REASON: [one sentence explanation]\n\n"
-    "If there is no MCQ, just answer whatever question is visible.\n"
-    "Be accurate — this may be about coding, database, networking, or linear algebra."
-)
+# Step 2: gpt-oss-120b reasons over extracted text and gives accurate answer
+REASONING_MODEL = "openai/gpt-oss-120b"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def call_groq(model: str, image_b64: str) -> str:
+def step1_extract(image_b64: str) -> str:
+    """
+    Step 1 — Scout reads the screenshot and extracts the question + options as clean text.
+    No answering here — just extraction.
+    """
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": model,
+        "model": VISION_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -48,10 +43,75 @@ def call_groq(model: str, image_b64: str) -> str:
                 },
                 {
                     "type": "text",
-                    "text": MCQ_PROMPT
+                    "text": (
+                        "Look at this screenshot carefully.\n"
+                        "Extract and write out:\n"
+                        "1. The full question text\n"
+                        "2. All answer options exactly as shown (A, B, C, D etc.)\n"
+                        "3. Any relevant context, code, diagram description, or table visible\n\n"
+                        "Write it all out as plain text. Do NOT answer the question yet.\n"
+                        "Just extract everything you see accurately."
+                    )
                 }
             ]
         }],
+        "max_tokens": 800,
+        "temperature": 0,
+        "stream": False,
+    }
+
+    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+
+    if resp.status_code == 429:
+        time.sleep(3)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "choices" not in data:
+        raise Exception(f"Scout unexpected response: {str(data)[:300]}")
+
+    content = data["choices"][0]["message"]["content"]
+    if not content or not content.strip():
+        raise Exception("Scout returned empty extraction")
+
+    return content.strip()
+
+
+def step2_answer(extracted_text: str) -> str:
+    """
+    Step 2 — gpt-oss-120b receives the clean extracted text and gives the accurate answer.
+    Pure text reasoning — no image needed here.
+    """
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": REASONING_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert in computer science, networking, databases, "
+                    "linear algebra, coding, and operating systems. "
+                    "You answer MCQ questions with high accuracy. "
+                    "Always reply in EXACTLY this format:\n"
+                    "ANSWER: [option letter or number]\n"
+                    "REASON: [one clear sentence explanation]\n\n"
+                    "If it is not an MCQ, answer the question directly and concisely."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Here is a question extracted from a screenshot:\n\n"
+                    f"{extracted_text}\n\n"
+                    f"What is the correct answer?"
+                )
+            }
+        ],
         "max_tokens": 200,
         "temperature": 0,
         "stream": False,
@@ -59,54 +119,31 @@ def call_groq(model: str, image_b64: str) -> str:
 
     resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
-    # Rate limited — wait and retry
     if resp.status_code == 429:
         time.sleep(3)
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
-    # Raise for any other HTTP error
     resp.raise_for_status()
-
     data = resp.json()
 
-    # Safe extraction with full debug on failure
     if "choices" not in data:
-        raise Exception(f"Unexpected response: {str(data)[:300]}")
+        raise Exception(f"GPT-OSS unexpected response: {str(data)[:300]}")
 
     content = data["choices"][0]["message"]["content"]
     if not content or not content.strip():
-        raise Exception("Model returned empty response")
+        raise Exception("GPT-OSS returned empty answer")
 
     return content.strip()
-
-
-def get_answer(image_b64: str) -> tuple:
-    # Try primary model first
-    try:
-        answer = call_groq(PRIMARY_MODEL, image_b64)
-        return answer, PRIMARY_MODEL
-    except Exception as e:
-        primary_err = str(e)
-
-    # Fallback to scout
-    try:
-        answer = call_groq(FALLBACK_MODEL, image_b64)
-        return answer, FALLBACK_MODEL
-    except Exception as e:
-        raise Exception(
-            f"Both models failed.\n"
-            f"Maverick: {primary_err}\n"
-            f"Scout: {str(e)}"
-        )
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "primary_model": PRIMARY_MODEL,
-        "fallback_model": FALLBACK_MODEL,
+        "step1_vision": VISION_MODEL,
+        "step2_reasoning": REASONING_MODEL,
         "groq_key_set": bool(GROQ_API_KEY),
+        "pipeline": "Scout extracts → GPT-OSS-120B answers",
     })
 
 
@@ -124,14 +161,23 @@ def process():
     except Exception:
         return jsonify({"error": "Invalid base64 image"}), 400
 
+    # ── Step 1: Scout extracts text from image ────────────────────────────
     try:
-        answer, model_used = get_answer(data["image"])
+        extracted_text = step1_extract(data["image"])
     except requests.exceptions.Timeout:
-        return jsonify({"error": "Groq API timed out. Try again."}), 504
+        return jsonify({"error": "Step 1 (Scout) timed out. Try again."}), 504
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": f"Step 1 (Scout extraction) failed: {str(e)}"}), 502
 
-    # Parse ANSWER line
+    # ── Step 2: GPT-OSS-120B answers from extracted text ─────────────────
+    try:
+        answer = step2_answer(extracted_text)
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Step 2 (GPT-OSS) timed out. Try again."}), 504
+    except Exception as e:
+        return jsonify({"error": f"Step 2 (GPT-OSS answer) failed: {str(e)}"}), 502
+
+    # Parse ANSWER line for quick display
     quick = answer
     match = re.search(r"ANSWER:\s*([^\n]+)", answer, re.IGNORECASE)
     if match:
@@ -140,7 +186,8 @@ def process():
     return jsonify({
         "answer": quick,
         "full_response": answer,
-        "model_used": model_used,
+        "extracted_text": extracted_text,
+        "model_used": f"Scout → GPT-OSS-120B",
     })
 
 
