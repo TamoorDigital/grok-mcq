@@ -5,52 +5,92 @@ import io
 import os
 import re
 import requests
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# ─── Groq API with Vision — NO Tesseract needed ───────────────────────────────
-# Get free key at: https://console.groq.com  (no credit card)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+# ─── API KEYS ─────────────────────────────────────────────────────────────────
+# Primary:  Gemini 2.5 Flash — best accuracy for coding/db/networking MCQs
+# Fallback: Groq             — fastest, kicks in if Gemini hits rate limit
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 
-# Vision model — reads image AND answers MCQ in one call, 1-3 seconds
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent"
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+MCQ_PROMPT = (
+    "Look at this screenshot carefully.\n"
+    "Find the MCQ question and all its options.\n"
+    "Reply ONLY in this exact format:\n"
+    "ANSWER: [option letter or number]\n"
+    "REASON: [one sentence explanation]\n\n"
+    "If there is no MCQ, just answer whatever question is visible. "
+    "Be accurate — this is a technical subject (coding, database, networking)."
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ask_groq_vision(image_b64: str) -> str:
-    """Send image directly to Groq Vision — no OCR step needed."""
+def ask_gemini(image_b64: str) -> str:
+    """Gemini 2.5 Flash — primary, best accuracy."""
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": image_b64
+                    }
+                },
+                {
+                    "text": MCQ_PROMPT
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 300,
+        }
+    }
+
+    resp = requests.post(
+        GEMINI_URL,
+        params={"key": GEMINI_API_KEY},
+        json=payload,
+        timeout=30,
+    )
+
+    # 429 = rate limited — raise so fallback kicks in
+    if resp.status_code == 429:
+        raise Exception("RATE_LIMIT")
+
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def ask_groq(image_b64: str) -> str:
+    """Groq Llama 4 Scout — fallback, ultra fast."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
         "model": GROQ_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_b64}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Look at this screenshot carefully.\n"
-                            "Find the MCQ question and all its options.\n"
-                            "Reply ONLY in this exact format:\n"
-                            "ANSWER: [option letter or number]\n"
-                            "REASON: [one sentence explanation]\n\n"
-                            "If there is no MCQ, just answer whatever question is visible."
-                        )
-                    }
-                ]
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                },
+                {
+                    "type": "text",
+                    "text": MCQ_PROMPT
+                }
+            ]
+        }],
         "max_tokens": 200,
         "temperature": 0,
         "stream": False,
@@ -59,7 +99,6 @@ def ask_groq_vision(image_b64: str) -> str:
     resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
     if resp.status_code == 429:
-        import time
         time.sleep(2)
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
@@ -68,42 +107,66 @@ def ask_groq_vision(image_b64: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+def get_answer(image_b64: str) -> tuple[str, str, str]:
+    """
+    Try Gemini first (accuracy), fall back to Groq (speed).
+    Returns (answer, model_used, fallback_reason)
+    """
+    fallback_reason = ""
+
+    # Try Gemini if key is set
+    if GEMINI_API_KEY:
+        try:
+            answer = ask_gemini(image_b64)
+            return answer, "gemini-2.5-flash", ""
+        except Exception as e:
+            err = str(e)
+            if "RATE_LIMIT" in err:
+                fallback_reason = "Gemini rate limit hit (10 RPM) — switched to Groq"
+            else:
+                fallback_reason = f"Gemini failed ({err[:80]}) — switched to Groq"
+
+    # Fallback to Groq
+    if GROQ_API_KEY:
+        answer = ask_groq(image_b64)
+        return answer, "groq-llama4-scout", fallback_reason
+
+    raise Exception("No API keys configured. Set GEMINI_API_KEY and/or GROQ_API_KEY in Render.")
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "model": GROQ_MODEL,
+        "primary": "Gemini 2.5 Flash" if GEMINI_API_KEY else "NOT SET",
+        "fallback": "Groq Llama 4 Scout" if GROQ_API_KEY else "NOT SET",
+        "gemini_key_set": bool(GEMINI_API_KEY),
         "groq_key_set": bool(GROQ_API_KEY),
-        "ocr": "disabled — using vision model directly",
     })
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY not set in Render environment variables"}), 500
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        return jsonify({"error": "No API keys set. Add GEMINI_API_KEY and GROQ_API_KEY in Render environment."}), 500
 
     data = request.get_json(force=True)
     if not data or "image" not in data:
         return jsonify({"error": "Missing 'image' field"}), 400
 
-    # Validate base64
     try:
         base64.b64decode(data["image"])
     except Exception:
         return jsonify({"error": "Invalid base64 image"}), 400
 
-    # Send image directly to Groq Vision — no OCR at all
     try:
-        answer = ask_groq_vision(data["image"])
+        answer, model_used, fallback_reason = get_answer(data["image"])
     except requests.exceptions.Timeout:
-        return jsonify({"error": "Groq API timed out. Try again."}), 504
-    except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"Groq API error: {str(e)}"}), 502
+        return jsonify({"error": "API timed out. Try again."}), 504
     except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 502
 
-    # Parse ANSWER line for quick display
+    # Parse ANSWER line
     quick = answer
     match = re.search(r"ANSWER:\s*([^\n]+)", answer, re.IGNORECASE)
     if match:
@@ -112,6 +175,8 @@ def process():
     return jsonify({
         "answer": quick,
         "full_response": answer,
+        "model_used": model_used,
+        "fallback_reason": fallback_reason,
     })
 
 
