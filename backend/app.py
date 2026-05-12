@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64
-import io
 import os
 import re
 import requests
@@ -10,19 +9,14 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-# ─── API KEYS ─────────────────────────────────────────────────────────────────
-# Primary:  Gemini 2.5 Flash — best accuracy for coding/db/networking MCQs
-# Fallback: Groq             — fastest, kicks in if Gemini hits rate limit
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+# ─── Groq API — Primary (fast + accurate with 70B model) ─────────────────────
+# Free: 14,400 requests/day, 30 RPM, no rate limit issues
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
-GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL  = "meta-llama/llama-4-scout-17b-16e-instruct"
-
-# Rate limit tracker — ensures minimum 6s gap between Gemini calls (= max 10/min safe)
-_last_gemini_call = 0.0
-GEMINI_MIN_INTERVAL = 6.0   # seconds between calls — stays under 10 RPM safely
+# llama-3.3-70b — much more accurate than 8B for coding/db/networking
+# still very fast on Groq LPU hardware (2-4 seconds)
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 MCQ_PROMPT = (
     "Look at this screenshot carefully.\n"
@@ -30,59 +24,13 @@ MCQ_PROMPT = (
     "Reply ONLY in this exact format:\n"
     "ANSWER: [option letter or number]\n"
     "REASON: [one sentence explanation]\n\n"
-    "If there is no MCQ, just answer whatever question is visible. "
-    "Be accurate — this is a technical subject (coding, database, networking)."
+    "If there is no MCQ, just answer whatever question is visible.\n"
+    "Be accurate — this may be about coding, database, networking, or OS."
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ask_gemini(image_b64: str) -> str:
-    """Gemini 2.0 Flash Lite — primary, 30 RPM free tier."""
-    global _last_gemini_call
-    # Enforce minimum interval to avoid rate limit
-    elapsed = time.time() - _last_gemini_call
-    if elapsed < GEMINI_MIN_INTERVAL:
-        time.sleep(GEMINI_MIN_INTERVAL - elapsed)
-    _last_gemini_call = time.time()
-
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": image_b64
-                    }
-                },
-                {
-                    "text": MCQ_PROMPT
-                }
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 300,
-        }
-    }
-
-    resp = requests.post(
-        GEMINI_URL,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
-        timeout=30,
-    )
-
-    # 429 = rate limited — raise so fallback kicks in
-    if resp.status_code == 429:
-        raise Exception("RATE_LIMIT")
-
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-
 def ask_groq(image_b64: str) -> str:
-    """Groq Llama 4 Scout — fallback, ultra fast."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -109,8 +57,9 @@ def ask_groq(image_b64: str) -> str:
 
     resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
+    # Rate limited — wait and retry once
     if resp.status_code == 429:
-        time.sleep(2)
+        time.sleep(3)
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
     resp.raise_for_status()
@@ -118,48 +67,21 @@ def ask_groq(image_b64: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-def get_answer(image_b64: str) -> tuple[str, str, str]:
-    """
-    Try Gemini first (accuracy), fall back to Groq (speed).
-    Returns (answer, model_used, fallback_reason)
-    """
-    fallback_reason = ""
-
-    # Try Gemini if key is set
-    if GEMINI_API_KEY:
-        try:
-            answer = ask_gemini(image_b64)
-            return answer, "gemini-2.0-flash-lite", ""
-        except Exception as e:
-            err = str(e)
-            if "RATE_LIMIT" in err:
-                fallback_reason = "Gemini rate limit hit (10 RPM) — switched to Groq"
-            else:
-                fallback_reason = f"Gemini failed ({err[:80]}) — switched to Groq"
-
-    # Fallback to Groq
-    if GROQ_API_KEY:
-        answer = ask_groq(image_b64)
-        return answer, "groq-llama4-scout", fallback_reason
-
-    raise Exception("No API keys configured. Set GEMINI_API_KEY and/or GROQ_API_KEY in Render.")
-
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "primary": "Gemini 2.5 Flash" if GEMINI_API_KEY else "NOT SET",
-        "fallback": "Groq Llama 4 Scout" if GROQ_API_KEY else "NOT SET",
-        "gemini_key_set": bool(GEMINI_API_KEY),
+        "model": GROQ_MODEL,
         "groq_key_set": bool(GROQ_API_KEY),
+        "daily_limit": "14,400 requests",
+        "rpm_limit": "30 RPM",
     })
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    if not GEMINI_API_KEY and not GROQ_API_KEY:
-        return jsonify({"error": "No API keys set. Add GEMINI_API_KEY and GROQ_API_KEY in Render environment."}), 500
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY not set in Render environment variables"}), 500
 
     data = request.get_json(force=True)
     if not data or "image" not in data:
@@ -171,9 +93,9 @@ def process():
         return jsonify({"error": "Invalid base64 image"}), 400
 
     try:
-        answer, model_used, fallback_reason = get_answer(data["image"])
+        answer = ask_groq(data["image"])
     except requests.exceptions.Timeout:
-        return jsonify({"error": "API timed out. Try again."}), 504
+        return jsonify({"error": "Groq API timed out. Try again."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -186,8 +108,7 @@ def process():
     return jsonify({
         "answer": quick,
         "full_response": answer,
-        "model_used": model_used,
-        "fallback_reason": fallback_reason,
+        "model_used": GROQ_MODEL,
     })
 
 
