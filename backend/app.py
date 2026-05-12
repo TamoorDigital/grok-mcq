@@ -9,14 +9,14 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-# ─── Groq API — Primary (fast + accurate with 70B model) ─────────────────────
-# Free: 14,400 requests/day, 30 RPM, no rate limit issues
+# ─── Groq API ─────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-# llama-3.3-70b — much more accurate than 8B for coding/db/networking
-# still very fast on Groq LPU hardware (2-4 seconds)
-GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Primary: maverick = most accurate vision model on Groq
+# Fallback: scout   = always works, slightly less accurate
+PRIMARY_MODEL  = "meta-llama/llama-4-maverick-17b-128e-instruct"
+FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 MCQ_PROMPT = (
     "Look at this screenshot carefully.\n"
@@ -25,24 +25,26 @@ MCQ_PROMPT = (
     "ANSWER: [option letter or number]\n"
     "REASON: [one sentence explanation]\n\n"
     "If there is no MCQ, just answer whatever question is visible.\n"
-    "Be accurate — this may be about coding, database, networking, or OS."
+    "Be accurate — this may be about coding, database, networking, or linear algebra."
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ask_groq(image_b64: str) -> str:
+def call_groq(model: str, image_b64: str) -> str:
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": [{
             "role": "user",
             "content": [
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_b64}"
+                    }
                 },
                 {
                     "type": "text",
@@ -57,24 +59,54 @@ def ask_groq(image_b64: str) -> str:
 
     resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
-    # Rate limited — wait and retry once
+    # Rate limited — wait and retry
     if resp.status_code == 429:
         time.sleep(3)
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
+    # Raise for any other HTTP error
     resp.raise_for_status()
+
     data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+
+    # Safe extraction with full debug on failure
+    if "choices" not in data:
+        raise Exception(f"Unexpected response: {str(data)[:300]}")
+
+    content = data["choices"][0]["message"]["content"]
+    if not content or not content.strip():
+        raise Exception("Model returned empty response")
+
+    return content.strip()
+
+
+def get_answer(image_b64: str) -> tuple:
+    # Try primary model first
+    try:
+        answer = call_groq(PRIMARY_MODEL, image_b64)
+        return answer, PRIMARY_MODEL
+    except Exception as e:
+        primary_err = str(e)
+
+    # Fallback to scout
+    try:
+        answer = call_groq(FALLBACK_MODEL, image_b64)
+        return answer, FALLBACK_MODEL
+    except Exception as e:
+        raise Exception(
+            f"Both models failed.\n"
+            f"Maverick: {primary_err}\n"
+            f"Scout: {str(e)}"
+        )
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "model": GROQ_MODEL,
+        "primary_model": PRIMARY_MODEL,
+        "fallback_model": FALLBACK_MODEL,
         "groq_key_set": bool(GROQ_API_KEY),
-        "daily_limit": "14,400 requests",
-        "rpm_limit": "30 RPM",
     })
 
 
@@ -93,7 +125,7 @@ def process():
         return jsonify({"error": "Invalid base64 image"}), 400
 
     try:
-        answer = ask_groq(data["image"])
+        answer, model_used = get_answer(data["image"])
     except requests.exceptions.Timeout:
         return jsonify({"error": "Groq API timed out. Try again."}), 504
     except Exception as e:
@@ -108,7 +140,7 @@ def process():
     return jsonify({
         "answer": quick,
         "full_response": answer,
-        "model_used": GROQ_MODEL,
+        "model_used": model_used,
     })
 
 
