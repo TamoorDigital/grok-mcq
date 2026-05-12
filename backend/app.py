@@ -16,7 +16,7 @@ GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
 # llama-3.3-70b — much more accurate than 8B for coding/db/networking
 # still very fast on Groq LPU hardware (2-4 seconds)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
 MCQ_PROMPT = (
     "Look at this screenshot carefully.\n"
